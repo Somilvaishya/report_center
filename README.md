@@ -1,33 +1,44 @@
-### Report Center
+# Report Center
 
-Custom reports and query tools for ERPNext
+A custom Frappe/ERPNext application designed to provide audit-ready, upgrade-safe financial reports and query tools.
 
-### Installation
+## Features
 
-You can install this app using the [bench](https://github.com/frappe/bench) CLI:
+### 1. General Ledger Audit Script Report
+A custom script report that inherits all filters, functions, and behaviors of the standard ERPNext **General Ledger** report, with the following additions:
+- **Created On Column**: Adds a `Created On` (`creation` datetime) column fetched directly from the `GL Entry` table, placed next to the `Posting Date`.
+- **Posting Date Audit Highlight**: Automatically highlights rows in **red** (soft red background with bold red text) if the `Posting Date` differs from the date portion of the `Created On` timestamp.
+- **Dynamic Filter Inheritance**: Synchronously inherits all filters (including dynamic Accounting Dimensions) from the standard General Ledger report.
 
-```bash
-cd $PATH_TO_YOUR_BENCH
-bench get-app $URL_OF_THIS_REPO --branch develop
-bench install-app report_center
+## Directory Structure
+
+```
+report_center/
+    report_center/
+        report/
+            general_ledger_audit/
+                general_ledger_audit.json   # Report Definition
+                general_ledger_audit.py     # Python wrap logic (fetch & insert columns)
+                general_ledger_audit.js     # JS Formatter & Row Colorizer
 ```
 
-### Contributing
+## Installation & Setup
 
-This app uses `pre-commit` for code formatting and linting. Please [install pre-commit](https://pre-commit.com/#installation) and enable it for this repository:
+1. Get the app from the GitHub repository:
+   ```bash
+   bench get-app https://github.com/Somilvaishya/report_center.git
+   ```
 
-```bash
-cd apps/report_center
-pre-commit install
-```
+2. Install the app on your site:
+   ```bash
+   bench --site [your-site-name] install-app report_center
+   ```
 
-Pre-commit is configured to use the following tools for checking and formatting your code:
+3. Clear cache and build assets:
+   ```bash
+   bench clear-cache
+   ```
 
-- ruff
-- eslint
-- prettier
-- pyupgrade
+## License
 
-### License
-
-mit
+MIT License
