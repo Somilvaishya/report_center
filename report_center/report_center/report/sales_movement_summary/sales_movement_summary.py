@@ -13,20 +13,23 @@ def execute(filters=None):
 def get_columns():
     return [
         {"fieldname": "sales_order", "label": "Sales Order", "fieldtype": "Link", "options": "Sales Order", "width": 130},
+        {"fieldname": "so_date", "label": "SO Date", "fieldtype": "Date", "width": 100},
         {"fieldname": "customer", "label": "Customer ID", "fieldtype": "Link", "options": "Customer", "width": 130},
         {"fieldname": "customer_name", "label": "Customer Name", "fieldtype": "Data", "width": 180},
-        {"fieldname": "so_date", "label": "SO Date", "fieldtype": "Date", "width": 100},
-        {"fieldname": "so_status", "label": "SO Status", "fieldtype": "Data", "width": 100},
-        {"fieldname": "delivery_note", "label": "Delivery Note", "fieldtype": "Link", "options": "Delivery Note", "width": 130},
-        {"fieldname": "dn_date", "label": "DN Date", "fieldtype": "Date", "width": 100},
-        {"fieldname": "dn_status", "label": "DN Status", "fieldtype": "Data", "width": 100},
-        {"fieldname": "delay_dispatch", "label": "Delay to Dispatch (Days)", "fieldtype": "Int", "width": 170},
-        {"fieldname": "delay_status", "label": "Delay Status", "fieldtype": "Data", "width": 120},
-        {"fieldname": "sales_invoice", "label": "Sales Invoice", "fieldtype": "Link", "options": "Sales Invoice", "width": 130},
-        {"fieldname": "si_date", "label": "SI Date", "fieldtype": "Date", "width": 100},
-        {"fieldname": "si_status", "label": "SI Status", "fieldtype": "Data", "width": 100},
+        {"fieldname": "customer_add", "label": "Customer Address", "fieldtype": "Data", "width": 200},
+        {"fieldname": "shipping_address", "label": "Shipping Address", "fieldtype": "Data", "width": 200},
+        {"fieldname": "created_by", "label": "Created By", "fieldtype": "Data", "width": 140},
+        {"fieldname": "item_code", "label": "Item Code", "fieldtype": "Link", "options": "Item", "width": 130},
+        {"fieldname": "item_name", "label": "Item Name", "fieldtype": "Data", "width": 200},
+        {"fieldname": "sale_qty", "label": "Sale Qty", "fieldtype": "Float", "width": 100},
+        {"fieldname": "delivered_qty", "label": "Delivered Qty", "fieldtype": "Float", "width": 100},
+        {"fieldname": "pending_qty", "label": "Pending Qty", "fieldtype": "Float", "width": 100},
+        {"fieldname": "sale_uom", "label": "Sale UOM", "fieldtype": "Link", "options": "UOM", "width": 100},
+        {"fieldname": "remarks", "label": "Remarks", "fieldtype": "Data", "width": 200},
+        {"fieldname": "billed_amount", "label": "Bill Amount", "fieldtype": "Currency", "width": 120},
         {"fieldname": "outstanding_amount", "label": "Outstanding Amount", "fieldtype": "Currency", "width": 140},
-        {"fieldname": "paid_amount", "label": "Paid Amount", "fieldtype": "Currency", "width": 120},
+        {"fieldname": "delay_dispatch", "label": "Delay to Dispatch (Days)", "fieldtype": "Int", "width": 170},
+        {"fieldname": "delay_status", "label": "Delay Status", "fieldtype": "Data", "width": 120}
     ]
 
 def get_data(filters):
@@ -40,30 +43,43 @@ def get_data(filters):
     if conditions:
         condition_str = "WHERE " + " AND ".join(conditions)
     
-    # We query Sales Orders and join with Delivery Note Items and Sales Invoice Items
+    # New Item-Level SQL to pull granular tracking
     sql = f"""
         SELECT
             so.name as sales_order,
+            so.transaction_date as so_date,
             so.customer,
             so.customer_name,
-            so.transaction_date as so_date,
-            so.status as so_status,
-            dn.name as delivery_note,
-            dn.posting_date as dn_date,
-            dn.status as dn_status,
-            si.name as sales_invoice,
-            si.posting_date as si_date,
-            si.status as si_status,
-            si.outstanding_amount,
-            si.paid_amount
-        FROM `tabSales Order` so
-        LEFT JOIN `tabDelivery Note Item` dni ON dni.against_sales_order = so.name
-        LEFT JOIN `tabDelivery Note` dn ON dn.name = dni.parent AND dn.docstatus = 1
-        LEFT JOIN `tabSales Invoice Item` sii ON sii.sales_order = so.name
-        LEFT JOIN `tabSales Invoice` si ON si.name = sii.parent AND si.docstatus = 1
+            so.customer_address as customer_add,
+            so.shipping_address_name as shipping_address,
+            so.owner as created_by,
+            soi.description as remarks,
+            soi.item_code,
+            soi.item_name,
+            soi.qty as sale_qty,
+            soi.delivered_qty as delivered_qty,
+            (soi.qty - soi.delivered_qty) as pending_qty,
+            soi.uom as sale_uom,
+            soi.billed_amt as billed_amount,
+            
+            -- Fetch outstanding amount at SO level using a subquery
+            (SELECT SUM(outstanding_amount) 
+             FROM `tabSales Invoice` 
+             WHERE docstatus = 1 AND name IN 
+                 (SELECT parent FROM `tabSales Invoice Item` WHERE sales_order = so.name)
+            ) as outstanding_amount,
+            
+            -- Fetch latest delivery date for this specific item using a subquery
+            (SELECT MAX(dn.posting_date) 
+             FROM `tabDelivery Note` dn 
+             JOIN `tabDelivery Note Item` dni ON dn.name = dni.parent 
+             WHERE dni.so_detail = soi.name AND dn.docstatus = 1
+            ) as latest_dn_date
+            
+        FROM `tabSales Order Item` soi
+        JOIN `tabSales Order` so ON so.name = soi.parent
         {condition_str}
-        GROUP BY so.name, dn.name, si.name
-        ORDER BY so.transaction_date DESC
+        ORDER BY so.transaction_date DESC, so.name ASC
     """
     
     raw_data = frappe.db.sql(sql, as_dict=True)
@@ -73,8 +89,9 @@ def get_data(filters):
         delay_dispatch = None
         delay_status = ""
         
-        if row.so_date and row.dn_date:
-            delay_dispatch = date_diff(row.dn_date, row.so_date)
+        # Calculate delay based on the latest DN date vs SO date
+        if row.so_date and row.latest_dn_date:
+            delay_dispatch = date_diff(row.latest_dn_date, row.so_date)
             if delay_dispatch <= 3:
                 delay_status = "On Time"
             elif 3 < delay_dispatch <= 5:
