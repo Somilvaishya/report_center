@@ -1,4 +1,11 @@
 frappe.query_reports["Sales Movement Summary"] = {
+	"onload": function(report) {
+		report.page.add_inner_button(__("Download Colored Excel"), function() {
+			let filters = report.get_values();
+			let url = frappe.urllib.get_full_url("/api/method/report_center.report_center.report.sales_movement_summary.sales_movement_summary.download_colored_excel");
+			open_url_post(url, { filters: JSON.stringify(filters) });
+		});
+	},
 	"filters": [
 		{
 			"fieldname": "from_date",

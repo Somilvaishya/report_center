@@ -29,6 +29,12 @@ frappe.query_reports["General Ledger Audit"] = {
 		if (frappe.query_reports["General Ledger"] && frappe.query_reports["General Ledger"].onload) {
 			frappe.query_reports["General Ledger"].onload(report);
 		}
+		
+		report.page.add_inner_button(__("Download Colored Excel"), function() {
+			let filters = report.get_values();
+			let url = frappe.urllib.get_full_url("/api/method/report_center.report_center.report.general_ledger_audit.general_ledger_audit.download_colored_excel");
+			open_url_post(url, { filters: JSON.stringify(filters) });
+		});
 	},
 
 	formatter: function(value, row, column, data, default_formatter) {
