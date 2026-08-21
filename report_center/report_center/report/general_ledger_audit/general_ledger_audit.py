@@ -4,6 +4,10 @@
 import frappe
 from frappe import _
 from erpnext.accounts.report.general_ledger.general_ledger import execute as execute_gl
+import json
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import PatternFill, Font
 
 
 def execute(filters=None):
@@ -126,3 +130,71 @@ def execute(filters=None):
 				row["supplier_shipping_gstin"] = address_data[d_address].get("gstin")
 
 	return columns, data
+
+@frappe.whitelist()
+def download_colored_excel(filters=None):
+    if isinstance(filters, str):
+        filters = json.loads(filters)
+        
+    filters = frappe._dict(filters or {})
+        
+    columns, data = execute(filters)
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "General Ledger Audit"
+    
+    # Write Headers
+    for col_idx, col in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col.get("label"))
+        cell.font = Font(bold=True)
+        
+    # Colors matching JS logic (light red background, red text)
+    red_fill = PatternFill(start_color="fff1f1", end_color="fff1f1", fill_type="solid")
+    red_font = Font(color="d9534f", bold=True)
+    
+    for row_idx, row in enumerate(data, start=2):
+        posting_date = row.get("posting_date")
+        creation = row.get("creation")
+        
+        apply_color = False
+        
+        if posting_date and creation:
+            # Handle formats: posting_date can be date obj/string, creation can be datetime/string
+            p_date_str = str(posting_date)[:10]
+            c_date_str = str(creation)[:10]
+            
+            if p_date_str != c_date_str:
+                apply_color = True
+                
+        for col_idx, col in enumerate(columns, start=1):
+            fieldname = col.get("fieldname")
+            val = row.get(fieldname)
+            
+            # Format val for excel properly if it's a date or datetime object, but str is usually fine for these reports
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            
+            if apply_color:
+                cell.fill = red_fill
+                cell.font = red_font
+                
+    # Auto-adjust column widths
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws.column_dimensions[column].width = adjusted_width
+
+    # Output to response
+    file_data = BytesIO()
+    wb.save(file_data)
+    
+    frappe.response['filename'] = "General_Ledger_Audit.xlsx"
+    frappe.response['filecontent'] = file_data.getvalue()
+    frappe.response['type'] = 'binary'

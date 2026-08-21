@@ -1,5 +1,9 @@
 import frappe
 from frappe.utils import date_diff
+import json
+from io import BytesIO
+import openpyxl
+from openpyxl.styles import PatternFill, Font
 
 def execute(filters=None):
     columns = get_columns()
@@ -85,3 +89,78 @@ def get_data(filters):
         data.append(row)
         
     return data
+
+@frappe.whitelist()
+def download_colored_excel(filters=None):
+    if isinstance(filters, str):
+        filters = json.loads(filters)
+        
+    filters = frappe._dict(filters or {})
+        
+    columns = get_columns()
+    data = get_data(filters)
+    
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Sales Movement Summary"
+    
+    # Write Headers
+    for col_idx, col in enumerate(columns, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col.get("label"))
+        cell.font = Font(bold=True)
+        
+    # Colors matching JS logic
+    green_fill = PatternFill(start_color="e7f5ee", end_color="e7f5ee", fill_type="solid")
+    green_font = Font(color="1e8a5b")
+    
+    yellow_fill = PatternFill(start_color="fff3cd", end_color="fff3cd", fill_type="solid")
+    yellow_font = Font(color="856404")
+    
+    red_fill = PatternFill(start_color="f8d7da", end_color="f8d7da", fill_type="solid")
+    red_font = Font(color="721c24")
+    
+    for row_idx, row in enumerate(data, start=2):
+        delay = row.get("delay_dispatch")
+        fill_to_apply = None
+        font_to_apply = None
+        
+        if delay is not None:
+            if delay <= 3:
+                fill_to_apply = green_fill
+                font_to_apply = green_font
+            elif 3 < delay <= 5:
+                fill_to_apply = yellow_fill
+                font_to_apply = yellow_font
+            elif delay > 5:
+                fill_to_apply = red_fill
+                font_to_apply = red_font
+                
+        for col_idx, col in enumerate(columns, start=1):
+            fieldname = col.get("fieldname")
+            val = row.get(fieldname)
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            
+            if fill_to_apply and font_to_apply:
+                cell.fill = fill_to_apply
+                cell.font = font_to_apply
+                
+    # Auto-adjust column widths
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[column].width = adjusted_width
+
+    # Output to response
+    file_data = BytesIO()
+    wb.save(file_data)
+    
+    frappe.response['filename'] = "Sales_Movement_Summary.xlsx"
+    frappe.response['filecontent'] = file_data.getvalue()
+    frappe.response['type'] = 'binary'
