@@ -70,7 +70,7 @@ def get_columns(view_mode="Hierarchical Journey Tree"):
 	
 	# Default: Hierarchical Journey Tree
 	return [
-		{"fieldname": "journey", "label": _("Journey / Stage"), "fieldtype": "Data", "width": 280},
+		{"fieldname": "journey", "label": _("Journey / Stage"), "fieldtype": "Data", "width": 320},
 		{"fieldname": "posting_date", "label": _("Date"), "fieldtype": "Date", "width": 95},
 		{"fieldname": "voucher_no", "label": _("Stock Entry No"), "fieldtype": "Dynamic Link", "options": "voucher_type", "width": 140},
 		{"fieldname": "bom_no", "label": _("BOM No"), "fieldtype": "Link", "options": "BOM", "width": 150},
@@ -99,14 +99,13 @@ class ManufacturingJourneyEngine:
 		self.bin_stock = {}
 		self.batch_stock = {}
 		self.loose_item_codes = set()
+		self.item_meta = {}
 		self.load_initial_metadata()
 
 	def load_initial_metadata(self):
-		# Pre-cache user names
 		for u in frappe.db.sql("SELECT name, full_name FROM `tabUser`", as_dict=True):
 			self.users[u.name] = u.full_name or u.name
 
-		# Pre-cache identified loose / sub-assembly items
 		loose_q = frappe.db.sql("""
 			SELECT DISTINCT p.item_code
 			FROM `tabStock Entry Detail` p
@@ -121,7 +120,6 @@ class ManufacturingJourneyEngine:
 		if not item_codes:
 			return
 
-		# Targeted Bin stock
 		bins = frappe.db.sql("""
 			SELECT item_code, warehouse, actual_qty, stock_value
 			FROM `tabBin`
@@ -130,7 +128,14 @@ class ManufacturingJourneyEngine:
 		for b in bins:
 			self.bin_stock[(b.item_code, b.warehouse)] = flt(b.actual_qty)
 
-		# Targeted Batch details & SLE stock
+		items = frappe.db.sql("""
+			SELECT item_code, item_name, stock_uom
+			FROM `tabItem`
+			WHERE item_code IN %(item_codes)s
+		""", {"item_codes": list(item_codes)}, as_dict=True)
+		for it in items:
+			self.item_meta[it.item_code] = it
+
 		if batch_nos:
 			batch_list = list(batch_nos)
 			batches = frappe.db.sql("""
@@ -149,28 +154,6 @@ class ManufacturingJourneyEngine:
 			""", {"batch_nos": batch_list}, as_dict=True)
 			for s in batch_sle:
 				self.batch_stock[(s.item_code, s.warehouse, s.batch_no)] = flt(s.qty)
-
-	def run(self, view_mode="Hierarchical Journey Tree"):
-		stage1_entries, stage2_entries = self.fetch_production_entries()
-
-		# Collect all items and batches involved to fetch stock in bulk with targeted indexing
-		all_items = set()
-		all_batches = set()
-		for se in stage1_entries + stage2_entries:
-			for item in se["finished_items"] + se["consumed_items"]:
-				if item.item_code:
-					all_items.add(item.item_code)
-				if item.batch_no:
-					all_batches.add(item.batch_no)
-
-		self.load_item_batch_stock(all_items, all_batches)
-		
-		if view_mode == "Batch Lineage Matrix":
-			return self.build_lineage_matrix(stage1_entries, stage2_entries)
-		elif view_mode == "Loose Item Reconciliation Summary":
-			return self.build_reconciliation_summary(stage1_entries, stage2_entries)
-		else:
-			return self.build_journey_tree(stage1_entries, stage2_entries)
 
 	def fetch_production_entries(self):
 		conditions = ["se.purpose = 'Manufacture'", "se.docstatus = 1"]
@@ -229,462 +212,508 @@ class ManufacturingJourneyEngine:
 			else:
 				se_grouped[se_no]["consumed_items"].append(r)
 
+		# Explicit, strict resolution of target loose items
+		target_loose_items = set()
+		if self.filters.get("loose_item_code"):
+			target_loose_items.add(self.filters.loose_item_code)
+		elif self.filters.get("fg_item_code"):
+			fg_code = self.filters.fg_item_code
+			for se in se_grouped.values():
+				if any(f.item_code == fg_code for f in se["finished_items"]):
+					for c in se["consumed_items"]:
+						if c.item_code in self.loose_item_codes:
+							target_loose_items.add(c.item_code)
+		elif self.filters.get("rm_item_code"):
+			rm_code = self.filters.rm_item_code
+			for se in se_grouped.values():
+				if any(c.item_code == rm_code for c in se["consumed_items"]):
+					for f in se["finished_items"]:
+						if f.item_code in self.loose_item_codes:
+							target_loose_items.add(f.item_code)
+		else:
+			target_loose_items = set(self.loose_item_codes)
+
 		stage1_entries = []
 		stage2_entries = []
+		seen_se1 = set()
+		seen_se2 = set()
 
 		for se_no, se in se_grouped.items():
-			produced_loose = [f for f in se["finished_items"] if f.item_code in self.loose_item_codes or (self.filters.loose_item_code and f.item_code == self.filters.loose_item_code)]
-			consumed_loose = [c for c in se["consumed_items"] if c.item_code in self.loose_item_codes or (self.filters.loose_item_code and c.item_code == self.filters.loose_item_code)]
+			# Check Stage 1: Produces an item in target_loose_items
+			is_s1 = any(f.item_code in target_loose_items for f in se["finished_items"])
+			if is_s1 and se_no not in seen_se1:
+				if not self.filters.get("rm_item_code") or any(c.item_code == self.filters.rm_item_code for c in se["consumed_items"]):
+					stage1_entries.append(se)
+					seen_se1.add(se_no)
 
-			if produced_loose:
-				stage1_entries.append(se)
-			if consumed_loose:
-				stage2_entries.append(se)
+			# Check Stage 2: Consumes an item in target_loose_items
+			is_s2 = any(c.item_code in target_loose_items for c in se["consumed_items"])
+			if is_s2 and se_no not in seen_se2:
+				if not self.filters.get("fg_item_code") or any(f.item_code == self.filters.fg_item_code for f in se["finished_items"]):
+					stage2_entries.append(se)
+					seen_se2.add(se_no)
 
-			if not produced_loose and not consumed_loose:
-				if self.filters.fg_item_code:
-					if any(f.item_code == self.filters.fg_item_code for f in se["finished_items"]):
-						stage2_entries.append(se)
-				elif self.filters.rm_item_code:
-					if any(c.item_code == self.filters.rm_item_code for c in se["consumed_items"]):
-						stage1_entries.append(se)
-				else:
-					if se["finished_items"]:
-						stage1_entries.append(se)
-
-		if self.filters.batch_no:
+		if self.filters.get("batch_no"):
 			b_filter = self.filters.batch_no
 			stage1_entries = [se for se in stage1_entries if any(f.batch_no == b_filter for f in se["finished_items"]) or any(c.batch_no == b_filter for c in se["consumed_items"])]
 			stage2_entries = [se for se in stage2_entries if any(f.batch_no == b_filter for f in se["finished_items"]) or any(c.batch_no == b_filter for c in se["consumed_items"])]
 
-		if self.filters.loose_item_code:
-			l_filter = self.filters.loose_item_code
-			stage1_entries = [se for se in stage1_entries if any(f.item_code == l_filter for f in se["finished_items"])]
-			stage2_entries = [se for se in stage2_entries if any(c.item_code == l_filter for c in se["consumed_items"])]
+		return stage1_entries, stage2_entries, target_loose_items
 
-		if self.filters.fg_item_code:
-			fg_filter = self.filters.fg_item_code
-			stage2_entries = [se for se in stage2_entries if any(f.item_code == fg_filter for f in se["finished_items"])]
+	def run(self, view_mode="Hierarchical Journey Tree"):
+		stage1_entries, stage2_entries, target_loose_items = self.fetch_production_entries()
 
-		if self.filters.rm_item_code:
-			rm_filter = self.filters.rm_item_code
-			stage1_entries = [se for se in stage1_entries if any(c.item_code == rm_filter for c in se["consumed_items"])]
+		all_items = set(target_loose_items)
+		all_batches = set()
+		for se in stage1_entries + stage2_entries:
+			for item in se["finished_items"] + se["consumed_items"]:
+				if item.item_code:
+					all_items.add(item.item_code)
+				if item.batch_no:
+					all_batches.add(item.batch_no)
 
-		return stage1_entries, stage2_entries
+		self.load_item_batch_stock(all_items, all_batches)
+		
+		report_summary, chart = self.compute_exact_metrics(stage1_entries, stage2_entries, target_loose_items)
 
-	def build_journey_tree(self, stage1_entries, stage2_entries):
-		data = []
+		if view_mode == "Batch Lineage Matrix":
+			data = self.build_lineage_matrix(stage1_entries, stage2_entries, target_loose_items)
+		elif view_mode == "Loose Item Reconciliation Summary":
+			data = self.build_reconciliation_summary(stage1_entries, stage2_entries, target_loose_items)
+		else:
+			data = self.build_journey_tree(stage1_entries, stage2_entries, target_loose_items)
+
+		return data, report_summary, chart
+
+	def compute_exact_metrics(self, stage1_entries, stage2_entries, target_loose_items):
 		tot_loose_qty = 0.0
 		tot_rm_val = 0.0
-		tot_fg_qty = 0.0
-		tot_fg_val = 0.0
-		tot_pack_val = 0.0
 		loose_stock_set = set()
 
-		stage2_by_loose_batch = {}
-		stage2_by_loose_item = {}
+		for se in stage1_entries:
+			for f in se["finished_items"]:
+				if f.item_code in target_loose_items:
+					tot_loose_qty += flt(f.qty)
+					loose_stock_set.add((f.item_code, f.t_warehouse))
+			for c in se["consumed_items"]:
+				if not self.filters.get("rm_item_code") or c.item_code == self.filters.rm_item_code:
+					tot_rm_val += flt(c.amount)
 
-		for se2 in stage2_entries:
-			for c in se2["consumed_items"]:
-				item = c.item_code
-				batch = c.batch_no
-				if batch:
-					stage2_by_loose_batch.setdefault((item, batch), []).append((se2, c))
-				stage2_by_loose_item.setdefault(item, []).append((se2, c))
-
-		for se1 in stage1_entries:
-			user_display = self.users.get(se1["owner"], se1["owner"])
-
-			for fg1 in se1["finished_items"]:
-				item_code = fg1.item_code
-				batch_no = fg1.batch_no or ""
-				wh = fg1.t_warehouse or ""
-				b_info = self.batches.get(batch_no, {})
-				
-				wh_stock = self.bin_stock.get((item_code, wh), 0.0)
-				b_stock = self.batch_stock.get((item_code, wh, batch_no), 0.0) if batch_no else wh_stock
-
-				tot_loose_qty += flt(fg1.qty)
-				loose_stock_set.add((item_code, wh))
-
-				batch_label = f" [Batch: {batch_no}]" if batch_no else ""
-				data.append({
-					"journey": f"🔵 [Stage 1: Bulk Produced] {fg1.item_name or item_code}{batch_label}",
-					"posting_date": se1["posting_date"],
-					"voucher_type": "Stock Entry",
-					"voucher_no": se1["se_no"],
-					"bom_no": se1["bom_no"],
-					"item_code": item_code,
-					"item_name": fg1.item_name,
-					"batch_no": batch_no,
-					"mfg_date": b_info.get("manufacturing_date"),
-					"expiry_date": b_info.get("expiry_date"),
-					"stage_type": "Loose Produced",
-					"qty": flt(fg1.qty),
-					"uom": fg1.stock_uom,
-					"basic_rate": flt(fg1.basic_rate),
-					"amount": flt(fg1.amount),
-					"warehouse": wh,
-					"current_batch_qty": b_stock,
-					"current_wh_qty": wh_stock,
-					"created_by": user_display,
-					"indent": 0
-				})
-
-				for rm in se1["consumed_items"]:
-					tot_rm_val += flt(rm.amount)
-					rm_b = rm.batch_no or ""
-					rm_wh = rm.s_warehouse or ""
-					rm_b_info = self.batches.get(rm_b, {})
-					rm_wh_stock = self.bin_stock.get((rm.item_code, rm_wh), 0.0)
-					rm_b_stock = self.batch_stock.get((rm.item_code, rm_wh, rm_b), 0.0) if rm_b else rm_wh_stock
-
-					rm_batch_str = f" [B#{rm_b}]" if rm_b else ""
-					data.append({
-						"journey": f"  ↳ 🟠 [RM Consumed] {rm.item_name or rm.item_code}{rm_batch_str}",
-						"posting_date": se1["posting_date"],
-						"voucher_type": "Stock Entry",
-						"voucher_no": se1["se_no"],
-						"bom_no": se1["bom_no"],
-						"item_code": rm.item_code,
-						"item_name": rm.item_name,
-						"batch_no": rm_b,
-						"mfg_date": rm_b_info.get("manufacturing_date"),
-						"expiry_date": rm_b_info.get("expiry_date"),
-						"stage_type": "RM Input",
-						"qty": flt(rm.qty),
-						"uom": rm.stock_uom,
-						"basic_rate": flt(rm.basic_rate),
-						"amount": flt(rm.amount),
-						"warehouse": rm_wh,
-						"current_batch_qty": rm_b_stock,
-						"current_wh_qty": rm_wh_stock,
-						"created_by": user_display,
-						"indent": 1
-					})
-
-				matched_se2 = []
-				if batch_no and (item_code, batch_no) in stage2_by_loose_batch:
-					matched_se2 = stage2_by_loose_batch[(item_code, batch_no)]
-				elif item_code in stage2_by_loose_item:
-					matched_se2 = [pair for pair in stage2_by_loose_item[item_code] if pair[0]["posting_date"] >= se1["posting_date"]]
-
-				seen_se2 = set()
-				for se2, c_line in matched_se2:
-					if se2["se_no"] in seen_se2:
-						continue
-					seen_se2.add(se2["se_no"])
-
-					se2_user = self.users.get(se2["owner"], se2["owner"])
-
-					for fg2 in se2["finished_items"]:
-						fg2_batch = fg2.batch_no or ""
-						fg2_wh = fg2.t_warehouse or ""
-						fg2_b_info = self.batches.get(fg2_batch, {})
-						fg2_wh_stock = self.bin_stock.get((fg2.item_code, fg2_wh), 0.0)
-						fg2_b_stock = self.batch_stock.get((fg2.item_code, fg2_wh, fg2_batch), 0.0) if fg2_batch else fg2_wh_stock
-
-						tot_fg_qty += flt(fg2.qty)
-						tot_fg_val += flt(fg2.amount)
-
-						fg_batch_str = f" [B#{fg2_batch}]" if fg2_batch else ""
-						data.append({
-							"journey": f"  ↳ 🟢 [Stage 2: Packaged FG] {fg2.item_name or fg2.item_code}{fg_batch_str}",
-							"posting_date": se2["posting_date"],
-							"voucher_type": "Stock Entry",
-							"voucher_no": se2["se_no"],
-							"bom_no": se2["bom_no"],
-							"item_code": fg2.item_code,
-							"item_name": fg2.item_name,
-							"batch_no": fg2_batch,
-							"mfg_date": fg2_b_info.get("manufacturing_date"),
-							"expiry_date": fg2_b_info.get("expiry_date"),
-							"stage_type": "FG Produced",
-							"qty": flt(fg2.qty),
-							"uom": fg2.stock_uom,
-							"basic_rate": flt(fg2.basic_rate),
-							"amount": flt(fg2.amount),
-							"warehouse": fg2_wh,
-							"current_batch_qty": fg2_b_stock,
-							"current_wh_qty": fg2_wh_stock,
-							"created_by": se2_user,
-							"indent": 1
-						})
-
-					for c_item in se2["consumed_items"]:
-						c_batch = c_item.batch_no or ""
-						c_wh = c_item.s_warehouse or ""
-						c_b_info = self.batches.get(c_batch, {})
-						c_wh_stock = self.bin_stock.get((c_item.item_code, c_wh), 0.0)
-						c_b_stock = self.batch_stock.get((c_item.item_code, c_wh, c_batch), 0.0) if c_batch else c_wh_stock
-
-						is_loose = (c_item.item_code == item_code)
-						if is_loose:
-							badge = "    ↳ 🔵 [Loose Consumed]"
-							st_type = "Loose Consumed"
-						else:
-							badge = "    ↳ 🟣 [Packaging]"
-							st_type = "Packaging Consumed"
-							tot_pack_val += flt(c_item.amount)
-
-						c_batch_str = f" [B#{c_batch}]" if c_batch else ""
-						data.append({
-							"journey": f"{badge} {c_item.item_name or c_item.item_code}{c_batch_str}",
-							"posting_date": se2["posting_date"],
-							"voucher_type": "Stock Entry",
-							"voucher_no": se2["se_no"],
-							"bom_no": se2["bom_no"],
-							"item_code": c_item.item_code,
-							"item_name": c_item.item_name,
-							"batch_no": c_batch,
-							"mfg_date": c_b_info.get("manufacturing_date"),
-							"expiry_date": c_b_info.get("expiry_date"),
-							"stage_type": st_type,
-							"qty": flt(c_item.qty),
-							"uom": c_item.stock_uom,
-							"basic_rate": flt(c_item.basic_rate),
-							"amount": flt(c_item.amount),
-							"warehouse": c_wh,
-							"current_batch_qty": c_b_stock,
-							"current_wh_qty": c_wh_stock,
-							"created_by": se2_user,
-							"indent": 2
-						})
-
-		current_loose_stock = sum(self.bin_stock.get(key, 0.0) for key in loose_stock_set)
-
-		report_summary = self.build_summary_cards(tot_loose_qty, tot_rm_val, tot_fg_qty, tot_fg_val, tot_pack_val, current_loose_stock)
-		chart = self.build_chart(tot_rm_val, tot_pack_val, tot_fg_val)
-
-		return data, report_summary, chart
-
-	def build_lineage_matrix(self, stage1_entries, stage2_entries):
-		data = []
-		tot_loose_qty = 0.0
-		tot_rm_val = 0.0
 		tot_fg_qty = 0.0
 		tot_fg_val = 0.0
 		tot_pack_val = 0.0
+		for se in stage2_entries:
+			for f in se["finished_items"]:
+				if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code:
+					tot_fg_qty += flt(f.qty)
+					tot_fg_val += flt(f.amount)
+			for c in se["consumed_items"]:
+				if c.item_code not in self.loose_item_codes:
+					tot_pack_val += flt(c.amount)
 
-		stage2_by_loose_item = {}
-		stage2_by_loose_batch = {}
-		for se2 in stage2_entries:
-			for c in se2["consumed_items"]:
-				if c.batch_no:
-					stage2_by_loose_batch.setdefault((c.item_code, c.batch_no), []).append((se2, c))
-				stage2_by_loose_item.setdefault(c.item_code, []).append((se2, c))
+		current_loose_stock = sum(self.bin_stock.get(key, 0.0) for key in loose_stock_set) if loose_stock_set else sum(qty for (it, wh), qty in self.bin_stock.items() if it in target_loose_items)
 
-		for se1 in stage1_entries:
-			se1_user = self.users.get(se1["owner"], se1["owner"])
-
-			rm_parts = []
-			rm_total = 0.0
-			for rm in se1["consumed_items"]:
-				rm_total += flt(rm.amount)
-				b_str = f" (#{rm.batch_no})" if rm.batch_no else ""
-				rm_parts.append(f"{rm.item_code}{b_str}: {rm.qty} {rm.stock_uom}")
-			rm_summary = ", ".join(rm_parts)
-			tot_rm_val += rm_total
-
-			for fg1 in se1["finished_items"]:
-				item_code = fg1.item_code
-				batch_no = fg1.batch_no or ""
-				wh = fg1.t_warehouse or ""
-				wh_stock = self.bin_stock.get((item_code, wh), 0.0)
-				tot_loose_qty += flt(fg1.qty)
-
-				matched_se2 = []
-				if batch_no and (item_code, batch_no) in stage2_by_loose_batch:
-					matched_se2 = stage2_by_loose_batch[(item_code, batch_no)]
-				elif item_code in stage2_by_loose_item:
-					matched_se2 = [p for p in stage2_by_loose_item[item_code] if p[0]["posting_date"] >= se1["posting_date"]]
-
-				if not matched_se2:
-					data.append({
-						"stage1_se": se1["se_no"],
-						"stage1_date": se1["posting_date"],
-						"stage1_user": se1_user,
-						"rm_summary": rm_summary,
-						"rm_cost": rm_total,
-						"loose_item_code": item_code,
-						"loose_item_name": fg1.item_name,
-						"loose_batch_no": batch_no,
-						"loose_qty_produced": flt(fg1.qty),
-						"loose_uom": fg1.stock_uom,
-						"loose_rate": flt(fg1.basic_rate),
-						"loose_val": flt(fg1.amount),
-						"loose_current_stock": wh_stock,
-						"stage2_se": "",
-						"stage2_date": None,
-						"stage2_user": "",
-						"stage2_bom": "",
-						"loose_qty_consumed": 0.0,
-						"packaging_summary": "-",
-						"packaging_cost": 0.0,
-						"fg_item_code": "-",
-						"fg_item_name": "Unpackaged / In Stock",
-						"fg_batch_no": "",
-						"fg_qty_produced": 0.0,
-						"fg_uom": "",
-						"fg_rate": 0.0,
-						"fg_value": 0.0,
-						"fg_current_stock": 0.0
-					})
-				else:
-					for se2, c_line in matched_se2:
-						se2_user = self.users.get(se2["owner"], se2["owner"])
-
-						pack_parts = []
-						pack_total = 0.0
-						for p in se2["consumed_items"]:
-							if p.item_code != item_code:
-								pack_total += flt(p.amount)
-								pack_parts.append(f"{p.item_name or p.item_code}: {p.qty}")
-						pack_summary = ", ".join(pack_parts)
-						tot_pack_val += pack_total
-
-						for fg2 in se2["finished_items"]:
-							fg2_wh = fg2.t_warehouse or ""
-							fg2_stock = self.bin_stock.get((fg2.item_code, fg2_wh), 0.0)
-							tot_fg_qty += flt(fg2.qty)
-							tot_fg_val += flt(fg2.amount)
-
-							data.append({
-								"stage1_se": se1["se_no"],
-								"stage1_date": se1["posting_date"],
-								"stage1_user": se1_user,
-								"rm_summary": rm_summary,
-								"rm_cost": rm_total,
-								"loose_item_code": item_code,
-								"loose_item_name": fg1.item_name,
-								"loose_batch_no": batch_no,
-								"loose_qty_produced": flt(fg1.qty),
-								"loose_uom": fg1.stock_uom,
-								"loose_rate": flt(fg1.basic_rate),
-								"loose_val": flt(fg1.amount),
-								"loose_current_stock": wh_stock,
-								"stage2_se": se2["se_no"],
-								"stage2_date": se2["posting_date"],
-								"stage2_user": se2_user,
-								"stage2_bom": se2["bom_no"],
-								"loose_qty_consumed": flt(c_line.qty),
-								"packaging_summary": pack_summary,
-								"packaging_cost": pack_total,
-								"fg_item_code": fg2.item_code,
-								"fg_item_name": fg2.item_name,
-								"fg_batch_no": fg2.batch_no or "",
-								"fg_qty_produced": flt(fg2.qty),
-								"fg_uom": fg2.stock_uom,
-								"fg_rate": flt(fg2.basic_rate),
-								"fg_value": flt(fg2.amount),
-								"fg_current_stock": fg2_stock
-							})
-
-		report_summary = self.build_summary_cards(tot_loose_qty, tot_rm_val, tot_fg_qty, tot_fg_val, tot_pack_val, 0)
-		chart = self.build_chart(tot_rm_val, tot_pack_val, tot_fg_val)
-		return data, report_summary, chart
-
-	def build_reconciliation_summary(self, stage1_entries, stage2_entries):
-		data = []
-		reconcile = {}
-
-		for se1 in stage1_entries:
-			rm_cost = sum(flt(rm.amount) for rm in se1["consumed_items"])
-			for fg1 in se1["finished_items"]:
-				code = fg1.item_code
-				if code not in reconcile:
-					reconcile[code] = {
-						"item_code": code,
-						"item_name": fg1.item_name,
-						"uom": fg1.stock_uom,
-						"produced_qty": 0.0,
-						"rm_cost": 0.0,
-						"consumed_qty": 0.0,
-						"packaging_cost": 0.0,
-						"fg_units": 0.0,
-						"fg_val": 0.0,
-					}
-				reconcile[code]["produced_qty"] += flt(fg1.qty)
-				reconcile[code]["rm_cost"] += rm_cost
-
-		for se2 in stage2_entries:
-			pack_cost = sum(flt(p.amount) for p in se2["consumed_items"] if p.item_code not in self.loose_item_codes)
-			fg_qty = sum(flt(f.qty) for f in se2["finished_items"])
-			fg_amount = sum(flt(f.amount) for f in se2["finished_items"])
-
-			for c in se2["consumed_items"]:
-				code = c.item_code
-				if code in reconcile:
-					reconcile[code]["consumed_qty"] += flt(c.qty)
-					reconcile[code]["packaging_cost"] += pack_cost
-					reconcile[code]["fg_units"] += fg_qty
-					reconcile[code]["fg_val"] += fg_amount
-
-		tot_loose_qty = 0.0
-		tot_rm_val = 0.0
-		tot_fg_qty = 0.0
-		tot_fg_val = 0.0
-		tot_pack_val = 0.0
-		tot_current_stock = 0.0
-
-		for code, rec in reconcile.items():
-			produced = rec["produced_qty"]
-			consumed = rec["consumed_qty"]
-			unconverted = produced - consumed
-			avg_cost = (rec["rm_cost"] / produced) if produced > 0 else 0.0
-
-			curr_stock = sum(qty for (item, wh), qty in self.bin_stock.items() if item == code)
-			variance = unconverted - curr_stock
-
-			tot_loose_qty += produced
-			tot_rm_val += rec["rm_cost"]
-			tot_fg_qty += rec["fg_units"]
-			tot_fg_val += rec["fg_val"]
-			tot_pack_val += rec["packaging_cost"]
-			tot_current_stock += curr_stock
-
-			data.append({
-				"loose_item_code": code,
-				"loose_item_name": rec["item_name"],
-				"uom": rec["uom"],
-				"total_produced_qty": round(produced, 3),
-				"total_rm_cost": round(rec["rm_cost"], 2),
-				"avg_rm_cost": round(avg_cost, 2),
-				"total_consumed_qty": round(consumed, 3),
-				"total_packaging_cost": round(rec["packaging_cost"], 2),
-				"total_fg_units": round(rec["fg_units"], 2),
-				"total_fg_val": round(rec["fg_val"], 2),
-				"unconverted_qty": round(unconverted, 3),
-				"current_wh_stock": round(curr_stock, 3),
-				"stock_discrepancy": round(variance, 3)
-			})
-
-		report_summary = self.build_summary_cards(tot_loose_qty, tot_rm_val, tot_fg_qty, tot_fg_val, tot_pack_val, tot_current_stock)
-		chart = self.build_chart(tot_rm_val, tot_pack_val, tot_fg_val)
-		return data, report_summary, chart
-
-	def build_summary_cards(self, loose_qty, rm_val, fg_qty, fg_val, pack_val, loose_stock):
 		currency = frappe.defaults.get_user_default("currency") or "INR"
-		return [
-			{"value": loose_qty, "indicator": "Blue", "label": _("Total Bulk / Loose Produced"), "datatype": "Float"},
-			{"value": rm_val, "indicator": "Orange", "label": _("Total RM Consumed Cost"), "datatype": "Currency", "currency": currency},
-			{"value": fg_qty, "indicator": "Green", "label": _("Total FG Units Produced"), "datatype": "Float"},
-			{"value": fg_val, "indicator": "Purple", "label": _("Total FG Valuation"), "datatype": "Currency", "currency": currency},
-			{"value": pack_val, "indicator": "Gray", "label": _("Total Packaging Cost Added"), "datatype": "Currency", "currency": currency},
-			{"value": loose_stock, "indicator": "Teal", "label": _("Current Loose Stock in Hand"), "datatype": "Float"},
+		summary = [
+			{"value": tot_loose_qty, "indicator": "Blue", "label": _("Total Bulk / Loose Produced"), "datatype": "Float"},
+			{"value": tot_rm_val, "indicator": "Orange", "label": _("Total RM Consumed Cost"), "datatype": "Currency", "currency": currency},
+			{"value": tot_fg_qty, "indicator": "Green", "label": _("Total FG Units Produced"), "datatype": "Float"},
+			{"value": tot_fg_val, "indicator": "Purple", "label": _("Total FG Valuation"), "datatype": "Currency", "currency": currency},
+			{"value": tot_pack_val, "indicator": "Gray", "label": _("Total Packaging Cost Added"), "datatype": "Currency", "currency": currency},
+			{"value": current_loose_stock, "indicator": "Teal", "label": _("Current Loose Stock in Hand"), "datatype": "Float"},
 		]
 
-	def build_chart(self, rm_val, pack_val, fg_val):
-		return {
+		chart = {
 			"data": {
 				"labels": [_("RM Consumed Cost"), _("Packaging Cost Added"), _("Net FG Produced Value")],
 				"datasets": [
 					{
 						"name": _("Cost & Valuation Breakdown"),
-						"values": [round(rm_val, 2), round(pack_val, 2), round(fg_val, 2)]
+						"values": [round(tot_rm_val, 2), round(tot_pack_val, 2), round(tot_fg_val, 2)]
 					}
 				]
 			},
 			"type": "bar",
 			"colors": ["#f59e0b", "#8b5cf6", "#10b981"]
 		}
+		return summary, chart
+
+	def build_journey_tree(self, stage1_entries, stage2_entries, target_loose_items):
+		data = []
+
+		for l_code in sorted(target_loose_items):
+			se1_for_loose = [se for se in stage1_entries if any(f.item_code == l_code for f in se["finished_items"])]
+			se2_for_loose = [se for se in stage2_entries if any(c.item_code == l_code for c in se["consumed_items"])]
+
+			if not se1_for_loose and not se2_for_loose:
+				continue
+
+			l_meta = self.item_meta.get(l_code)
+			l_name = l_meta.item_name if l_meta else l_code
+			l_uom = l_meta.stock_uom if l_meta else ""
+			wh_stock = sum(qty for (it, wh), qty in self.bin_stock.items() if it == l_code)
+
+			total_s1_qty = sum(flt(f.qty) for se in se1_for_loose for f in se["finished_items"] if f.item_code == l_code)
+			total_s1_cost = sum(flt(c.amount) for se in se1_for_loose for c in se["consumed_items"])
+			total_s2_consumed = sum(flt(c.qty) for se in se2_for_loose for c in se["consumed_items"] if c.item_code == l_code)
+			total_s2_fg_qty = sum(flt(f.qty) for se in se2_for_loose for f in se["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code)
+			total_s2_fg_val = sum(flt(f.amount) for se in se2_for_loose for f in se["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code)
+
+			# Node 0: Loose Item Overview Node
+			data.append({
+				"journey": f"🏷️ [Loose Item] {l_name} ({l_code})",
+				"item_code": l_code,
+				"item_name": l_name,
+				"uom": l_uom,
+				"qty": total_s1_qty,
+				"current_wh_qty": wh_stock,
+				"stage_type": "Loose Item Header",
+				"created_by": f"Stock: {wh_stock} {l_uom}",
+				"indent": 0
+			})
+
+			# Node 1: Stage 1 Section Header
+			if se1_for_loose:
+				data.append({
+					"journey": f"🔵 [Stage 1: Bulk Production] {len(se1_for_loose)} Entries | Produced: {total_s1_qty:,.2f} {l_uom} | RM Cost: ₹{total_s1_cost:,.2f}",
+					"item_code": l_code,
+					"item_name": l_name,
+					"uom": l_uom,
+					"qty": total_s1_qty,
+					"amount": total_s1_cost,
+					"stage_type": "Stage 1 Section",
+					"indent": 1
+				})
+
+				for se1 in se1_for_loose:
+					se1_user = self.users.get(se1["owner"], se1["owner"])
+					fg1 = next((f for f in se1["finished_items"] if f.item_code == l_code), None)
+					if not fg1:
+						continue
+
+					batch_no = fg1.batch_no or ""
+					wh = fg1.t_warehouse or ""
+					b_info = self.batches.get(batch_no, {})
+					wh_stock_entry = self.bin_stock.get((l_code, wh), 0.0)
+					b_stock = self.batch_stock.get((l_code, wh, batch_no), 0.0) if batch_no else wh_stock_entry
+
+					b_label = f" [B#{batch_no}]" if batch_no else ""
+					data.append({
+						"journey": f"🔵 [Stage 1 SE] {se1['se_no']}{b_label}",
+						"posting_date": se1["posting_date"],
+						"voucher_type": "Stock Entry",
+						"voucher_no": se1["se_no"],
+						"bom_no": se1["bom_no"],
+						"item_code": l_code,
+						"item_name": fg1.item_name or l_name,
+						"batch_no": batch_no,
+						"mfg_date": b_info.get("manufacturing_date"),
+						"expiry_date": b_info.get("expiry_date"),
+						"stage_type": "Loose Produced",
+						"qty": flt(fg1.qty),
+						"uom": fg1.stock_uom,
+						"basic_rate": flt(fg1.basic_rate),
+						"amount": flt(fg1.amount),
+						"warehouse": wh,
+						"current_batch_qty": b_stock,
+						"current_wh_qty": wh_stock_entry,
+						"created_by": se1_user,
+						"indent": 2
+					})
+
+					for rm in se1["consumed_items"]:
+						rm_b = rm.batch_no or ""
+						rm_wh = rm.s_warehouse or ""
+						rm_b_info = self.batches.get(rm_b, {})
+						rm_wh_stock = self.bin_stock.get((rm.item_code, rm_wh), 0.0)
+						rm_b_stock = self.batch_stock.get((rm.item_code, rm_wh, rm_b), 0.0) if rm_b else rm_wh_stock
+						rm_batch_str = f" [B#{rm_b}]" if rm_b else ""
+
+						data.append({
+							"journey": f"  ↳ 🟠 [RM Consumed] {rm.item_name or rm.item_code}{rm_batch_str}",
+							"posting_date": se1["posting_date"],
+							"voucher_type": "Stock Entry",
+							"voucher_no": se1["se_no"],
+							"bom_no": se1["bom_no"],
+							"item_code": rm.item_code,
+							"item_name": rm.item_name,
+							"batch_no": rm_b,
+							"mfg_date": rm_b_info.get("manufacturing_date"),
+							"expiry_date": rm_b_info.get("expiry_date"),
+							"stage_type": "RM Input",
+							"qty": flt(rm.qty),
+							"uom": rm.stock_uom,
+							"basic_rate": flt(rm.basic_rate),
+							"amount": flt(rm.amount),
+							"warehouse": rm_wh,
+							"current_batch_qty": rm_b_stock,
+							"current_wh_qty": rm_wh_stock,
+							"created_by": se1_user,
+							"indent": 3
+						})
+
+			# Node 1: Stage 2 Section Header
+			if se2_for_loose:
+				data.append({
+					"journey": f"🟢 [Stage 2: Packaging Runs] {len(se2_for_loose)} Entries | Packaged: {total_s2_consumed:,.2f} {l_uom} ➔ {total_s2_fg_qty:,.2f} FG Units | Valuation: ₹{total_s2_fg_val:,.2f}",
+					"item_code": l_code,
+					"item_name": l_name,
+					"uom": "Units",
+					"qty": total_s2_fg_qty,
+					"amount": total_s2_fg_val,
+					"stage_type": "Stage 2 Section",
+					"indent": 1
+				})
+
+				for se2 in se2_for_loose:
+					se2_user = self.users.get(se2["owner"], se2["owner"])
+
+					fg_list = [f for f in se2["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code]
+					fg_desc = ", ".join(f"{f.item_name or f.item_code} ({flt(f.qty)} {f.stock_uom})" for f in fg_list)
+
+					data.append({
+						"journey": f"🟢 [Stage 2 SE] {se2['se_no']}",
+						"posting_date": se2["posting_date"],
+						"voucher_type": "Stock Entry",
+						"voucher_no": se2["se_no"],
+						"bom_no": se2["bom_no"],
+						"item_code": fg_list[0].item_code if fg_list else "",
+						"item_name": fg_desc,
+						"stage_type": "FG Produced",
+						"qty": sum(flt(f.qty) for f in fg_list),
+						"amount": sum(flt(f.amount) for f in fg_list),
+						"created_by": se2_user,
+						"indent": 2
+					})
+
+					# Loose Item Consumed
+					c_loose = next((c for c in se2["consumed_items"] if c.item_code == l_code), None)
+					if c_loose:
+						c_batch = c_loose.batch_no or ""
+						c_wh = c_loose.s_warehouse or ""
+						c_b_info = self.batches.get(c_batch, {})
+						c_wh_stock = self.bin_stock.get((l_code, c_wh), 0.0)
+						c_b_stock = self.batch_stock.get((l_code, c_wh, c_batch), 0.0) if c_batch else c_wh_stock
+						c_batch_str = f" [B#{c_batch}]" if c_batch else ""
+
+						data.append({
+							"journey": f"  ↳ 🔵 [Loose Consumed] {c_loose.item_name or l_code}{c_batch_str}",
+							"posting_date": se2["posting_date"],
+							"voucher_type": "Stock Entry",
+							"voucher_no": se2["se_no"],
+							"bom_no": se2["bom_no"],
+							"item_code": l_code,
+							"item_name": c_loose.item_name or l_name,
+							"batch_no": c_batch,
+							"mfg_date": c_b_info.get("manufacturing_date"),
+							"expiry_date": c_b_info.get("expiry_date"),
+							"stage_type": "Loose Consumed",
+							"qty": flt(c_loose.qty),
+							"uom": c_loose.stock_uom,
+							"basic_rate": flt(c_loose.basic_rate),
+							"amount": flt(c_loose.amount),
+							"warehouse": c_wh,
+							"current_batch_qty": c_b_stock,
+							"current_wh_qty": c_wh_stock,
+							"created_by": se2_user,
+							"indent": 3
+						})
+
+					# Packaging Materials Consumed
+					for p_item in se2["consumed_items"]:
+						if p_item.item_code == l_code:
+							continue
+						p_batch = p_item.batch_no or ""
+						p_wh = p_item.s_warehouse or ""
+						p_b_info = self.batches.get(p_batch, {})
+						p_wh_stock = self.bin_stock.get((p_item.item_code, p_wh), 0.0)
+						p_b_stock = self.batch_stock.get((p_item.item_code, p_wh, p_batch), 0.0) if p_batch else p_wh_stock
+						p_batch_str = f" [B#{p_batch}]" if p_batch else ""
+
+						data.append({
+							"journey": f"  ↳ 🟣 [Packaging] {p_item.item_name or p_item.item_code}{p_batch_str}",
+							"posting_date": se2["posting_date"],
+							"voucher_type": "Stock Entry",
+							"voucher_no": se2["se_no"],
+							"bom_no": se2["bom_no"],
+							"item_code": p_item.item_code,
+							"item_name": p_item.item_name,
+							"batch_no": p_batch,
+							"mfg_date": p_b_info.get("manufacturing_date"),
+							"expiry_date": p_b_info.get("expiry_date"),
+							"stage_type": "Packaging Consumed",
+							"qty": flt(p_item.qty),
+							"uom": p_item.stock_uom,
+							"basic_rate": flt(p_item.basic_rate),
+							"amount": flt(p_item.amount),
+							"warehouse": p_wh,
+							"current_batch_qty": p_b_stock,
+							"current_wh_qty": p_wh_stock,
+							"created_by": se2_user,
+							"indent": 3
+						})
+
+					# Finished Goods Produced
+					for fg in fg_list:
+						fg_batch = fg.batch_no or ""
+						fg_wh = fg.t_warehouse or ""
+						fg_b_info = self.batches.get(fg_batch, {})
+						fg_wh_stock = self.bin_stock.get((fg.item_code, fg_wh), 0.0)
+						fg_b_stock = self.batch_stock.get((fg.item_code, fg_wh, fg_batch), 0.0) if fg_batch else fg_wh_stock
+						fg_batch_str = f" [B#{fg_batch}]" if fg_batch else ""
+
+						data.append({
+							"journey": f"  ↳ ✨ [FG Produced] {fg.item_name or fg.item_code}{fg_batch_str}",
+							"posting_date": se2["posting_date"],
+							"voucher_type": "Stock Entry",
+							"voucher_no": se2["se_no"],
+							"bom_no": se2["bom_no"],
+							"item_code": fg.item_code,
+							"item_name": fg.item_name,
+							"batch_no": fg_batch,
+							"mfg_date": fg_b_info.get("manufacturing_date"),
+							"expiry_date": fg_b_info.get("expiry_date"),
+							"stage_type": "FG Produced",
+							"qty": flt(fg.qty),
+							"uom": fg.stock_uom,
+							"basic_rate": flt(fg.basic_rate),
+							"amount": flt(fg.amount),
+							"warehouse": fg_wh,
+							"current_batch_qty": fg_b_stock,
+							"current_wh_qty": fg_wh_stock,
+							"created_by": se2_user,
+							"indent": 3
+						})
+
+		return data
+
+	def build_lineage_matrix(self, stage1_entries, stage2_entries, target_loose_items):
+		data = []
+
+		for l_code in sorted(target_loose_items):
+			se1_for_loose = [se for se in stage1_entries if any(f.item_code == l_code for f in se["finished_items"])]
+			se2_for_loose = [se for se in stage2_entries if any(c.item_code == l_code for c in se["consumed_items"])]
+
+			l_meta = self.item_meta.get(l_code)
+			l_name = l_meta.item_name if l_meta else l_code
+			wh_stock = sum(qty for (it, wh), qty in self.bin_stock.items() if it == l_code)
+
+			s1_rows = []
+			for se1 in se1_for_loose:
+				se1_user = self.users.get(se1["owner"], se1["owner"])
+				fg1 = next((f for f in se1["finished_items"] if f.item_code == l_code), None)
+				if not fg1:
+					continue
+				rm_parts = [f"{rm.item_code}: {rm.qty} {rm.stock_uom}" for rm in se1["consumed_items"]]
+				rm_total = sum(flt(rm.amount) for rm in se1["consumed_items"])
+
+				s1_rows.append({
+					"stage1_se": se1["se_no"],
+					"stage1_date": se1["posting_date"],
+					"stage1_user": se1_user,
+					"rm_summary": ", ".join(rm_parts),
+					"rm_cost": rm_total,
+					"loose_item_code": l_code,
+					"loose_item_name": fg1.item_name or l_name,
+					"loose_batch_no": fg1.batch_no or "",
+					"loose_qty_produced": flt(fg1.qty),
+					"loose_uom": fg1.stock_uom,
+					"loose_rate": flt(fg1.basic_rate),
+					"loose_val": flt(fg1.amount),
+					"loose_current_stock": wh_stock,
+				})
+
+			s2_rows = []
+			for se2 in se2_for_loose:
+				se2_user = self.users.get(se2["owner"], se2["owner"])
+				c_loose = next((c for c in se2["consumed_items"] if c.item_code == l_code), None)
+				loose_qty = flt(c_loose.qty) if c_loose else 0.0
+
+				pack_parts = [f"{p.item_name or p.item_code}: {p.qty}" for p in se2["consumed_items"] if p.item_code != l_code]
+				pack_total = sum(flt(p.amount) for p in se2["consumed_items"] if p.item_code != l_code)
+
+				fg_list = [f for f in se2["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code]
+				for fg in fg_list:
+					fg_wh = fg.t_warehouse or ""
+					fg_stock = self.bin_stock.get((fg.item_code, fg_wh), 0.0)
+
+					s2_rows.append({
+						"stage2_se": se2["se_no"],
+						"stage2_date": se2["posting_date"],
+						"stage2_user": se2_user,
+						"stage2_bom": se2["bom_no"],
+						"loose_qty_consumed": loose_qty,
+						"packaging_summary": ", ".join(pack_parts),
+						"packaging_cost": pack_total,
+						"fg_item_code": fg.item_code,
+						"fg_item_name": fg.item_name,
+						"fg_batch_no": fg.batch_no or "",
+						"fg_qty_produced": flt(fg.qty),
+						"fg_uom": fg.stock_uom,
+						"fg_rate": flt(fg.basic_rate),
+						"fg_value": flt(fg.amount),
+						"fg_current_stock": fg_stock
+					})
+
+			max_len = max(len(s1_rows), len(s2_rows))
+			for i in range(max_len):
+				r1 = s1_rows[i] if i < len(s1_rows) else {
+					"stage1_se": "", "stage1_date": None, "stage1_user": "", "rm_summary": "-", "rm_cost": 0.0,
+					"loose_item_code": l_code, "loose_item_name": l_name, "loose_batch_no": "",
+					"loose_qty_produced": 0.0, "loose_uom": "", "loose_rate": 0.0, "loose_val": 0.0, "loose_current_stock": wh_stock
+				}
+				r2 = s2_rows[i] if i < len(s2_rows) else {
+					"stage2_se": "", "stage2_date": None, "stage2_user": "", "stage2_bom": "", "loose_qty_consumed": 0.0,
+					"packaging_summary": "-", "packaging_cost": 0.0, "fg_item_code": "-", "fg_item_name": "Unpackaged / In Stock",
+					"fg_batch_no": "", "fg_qty_produced": 0.0, "fg_uom": "", "fg_rate": 0.0, "fg_value": 0.0, "fg_current_stock": 0.0
+				}
+				merged = dict(r1)
+				merged.update(r2)
+				data.append(merged)
+
+		return data
+
+	def build_reconciliation_summary(self, stage1_entries, stage2_entries, target_loose_items):
+		data = []
+
+		for l_code in sorted(target_loose_items):
+			se1_for_loose = [se for se in stage1_entries if any(f.item_code == l_code for f in se["finished_items"])]
+			se2_for_loose = [se for se in stage2_entries if any(c.item_code == l_code for c in se["consumed_items"])]
+
+			if not se1_for_loose and not se2_for_loose:
+				continue
+
+			l_meta = self.item_meta.get(l_code)
+			l_name = l_meta.item_name if l_meta else l_code
+			l_uom = l_meta.stock_uom if l_meta else ""
+			wh_stock = sum(qty for (it, wh), qty in self.bin_stock.items() if it == l_code)
+
+			produced_qty = sum(flt(f.qty) for se in se1_for_loose for f in se["finished_items"] if f.item_code == l_code)
+			rm_cost = sum(flt(c.amount) for se in se1_for_loose for c in se["consumed_items"])
+			avg_cost = (rm_cost / produced_qty) if produced_qty > 0 else 0.0
+
+			consumed_qty = sum(flt(c.qty) for se in se2_for_loose for c in se["consumed_items"] if c.item_code == l_code)
+			pack_cost = sum(flt(p.amount) for se in se2_for_loose for p in se["consumed_items"] if p.item_code not in self.loose_item_codes)
+			fg_units = sum(flt(f.qty) for se in se2_for_loose for f in se["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code)
+			fg_val = sum(flt(f.amount) for se in se2_for_loose for f in se["finished_items"] if not self.filters.get("fg_item_code") or f.item_code == self.filters.fg_item_code)
+
+			unconverted = produced_qty - consumed_qty
+			variance = unconverted - wh_stock
+
+			data.append({
+				"loose_item_code": l_code,
+				"loose_item_name": l_name,
+				"uom": l_uom,
+				"total_produced_qty": round(produced_qty, 3),
+				"total_rm_cost": round(rm_cost, 2),
+				"avg_rm_cost": round(avg_cost, 2),
+				"total_consumed_qty": round(consumed_qty, 3),
+				"total_packaging_cost": round(pack_cost, 2),
+				"total_fg_units": round(fg_units, 2),
+				"total_fg_val": round(fg_val, 2),
+				"unconverted_qty": round(unconverted, 3),
+				"current_wh_stock": round(wh_stock, 3),
+				"stock_discrepancy": round(variance, 3)
+			})
+
+		return data
