@@ -17,6 +17,11 @@ class TestBatchTraceability(FrappeTestCase):
 			self.make_chain()
 
 	def make_chain(self):
+		# ERPNext v16 refuses batch items until this is ticked; a fresh v16 site has it off and the
+		# field does not exist on v15. The test transaction rolls the change back.
+		if frappe.get_meta("Stock Settings").has_field("enable_serial_and_batch_no_for_item"):
+			frappe.db.set_single_value("Stock Settings", "enable_serial_and_batch_no_for_item", 1)
+
 		self.company = get_company()
 		self.store, self.wip = frappe.get_all(
 			"Warehouse",
