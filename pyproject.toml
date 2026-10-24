@@ -4,7 +4,7 @@ authors = [
     { name = "Antigravity", email = "antigravity@gemini.ai"}
 ]
 description = "Custom reports and query tools for ERPNext"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
