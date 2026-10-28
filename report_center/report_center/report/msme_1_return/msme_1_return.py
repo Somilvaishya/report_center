@@ -200,6 +200,18 @@ class MSMEReturn:
 				pluck="parent",
 			)
 		)
+		# Money in or out through a bank or cash account: a credit is the supplier paying us back, never a bill.
+		banked = set(
+			frappe.db.sql_list(
+				"""
+				select distinct jea.parent
+				from `tabJournal Entry Account` jea
+				join `tabAccount` acc on acc.name = jea.account
+				where jea.parent in %(names)s and acc.account_type in ('Bank', 'Cash')
+				""",
+				{"names": list(names["Journal Entry"]) or [""]},
+			)
+		)
 
 		for e in entries:
 			e.net = flt(e.net, 2)
@@ -218,8 +230,8 @@ class MSMEReturn:
 				e.kind = "payment" if e.net < 0 else "refund"
 			elif e.voucher_type == "Journal Entry":
 				je_type = (journals.get(e.voucher_no) or {}).get("voucher_type")
-				if e.voucher_no in contra:
-					# Set-off: a debit settles bills like a payment; a credit takes earlier payments back.
+				if e.voucher_no in contra or e.voucher_no in banked:
+					# Set-off or bank/cash: a debit settles bills like a payment; a credit takes earlier payments back.
 					e.kind = "refund" if e.net > 0 else "payment"
 				elif e.net > 0:
 					e.kind = "invoice"  # bills and opening balances booked by journal
