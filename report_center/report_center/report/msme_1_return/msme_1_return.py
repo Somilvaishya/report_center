@@ -157,16 +157,32 @@ class MSMEReturn:
 		return self
 
 	def get_suppliers(self):
+		"""Micro and Small suppliers as on period end.
+
+		The MSME Details table decides for any supplier that has rows in it; the older flat fields
+		count only for suppliers without any, and only on sites that still have those columns.
+		"""
 		types = {"Micro": ["Micro"], "Small": ["Small"]}.get(self.filters.msme_type, ["Micro", "Small"])
-		filters = {"custom_msme_registered": "Yes", "custom_msme_type": ("in", types)}
-		if self.filters.supplier:
-			filters["name"] = self.filters.supplier
-		return {
-			s.name: s
-			for s in frappe.get_all(
-				"Supplier", filters=filters, fields=["name", "supplier_name", "pan", "custom_msme_type"]
-			)
-		}
+		legacy = all(frappe.db.has_column("Supplier", f) for f in ("custom_msme_registered", "custom_msme_type"))
+		fields = ["name", "supplier_name", "pan"]
+		if legacy:
+			fields += ["custom_msme_registered", "custom_msme_type"]
+		filters = {"name": self.filters.supplier} if self.filters.supplier else {}
+
+		in_table, current = get_msme_details(self.to_date)
+		suppliers = {}
+		for s in frappe.get_all("Supplier", filters=filters, fields=fields):
+			if s.name in in_table:
+				d = current.get(s.name) or frappe._dict()
+				registered, msme_type = d.msme_registered, d.msme_type
+			elif legacy:
+				registered, msme_type = s.custom_msme_registered, s.custom_msme_type
+			else:
+				continue
+			if registered == "Yes" and msme_type in types:
+				s.custom_msme_type = msme_type
+				suppliers[s.name] = s
+		return suppliers
 
 	def get_ledger(self, suppliers):
 		"""One net amount per voucher per supplier, up to period end, with what FIFO needs to know about it."""
@@ -338,6 +354,24 @@ def get_details(doctype, names, fields):
 	return {
 		d.name: d for d in frappe.get_all(doctype, filters={"name": ("in", list(names[doctype]))}, fields=fields)
 	}
+
+
+def get_msme_details(to_date):
+	"""Suppliers with any MSME Details row, and each one's row in force on `to_date` (none if all start later)."""
+	if not frappe.db.table_exists("MSME Registration Detail"):
+		return set(), {}
+	rows = frappe.get_all(
+		"MSME Registration Detail",
+		filters={"parenttype": "Supplier", "parentfield": "custom_msme_details"},
+		fields=["parent", "msme_registered", "msme_type", "effective_from"],
+		order_by="effective_from asc, idx asc",
+	)
+	in_table, current = set(), {}
+	for d in rows:  # oldest first, so the latest row already in force wins
+		in_table.add(d.parent)
+		if not d.effective_from or getdate(d.effective_from) <= to_date:
+			current[d.parent] = d
+	return in_table, current
 
 
 class Bill(frappe._dict):
