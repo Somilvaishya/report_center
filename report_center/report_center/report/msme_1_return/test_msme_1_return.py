@@ -1,5 +1,6 @@
 import io
 import zipfile
+from unittest.mock import patch
 
 import frappe
 import openpyxl
@@ -135,6 +136,54 @@ class TestMSME1Return(FrappeTestCase):
 			]
 		)
 		self.assertEqual(row["out_le_no"] + row["other_no"], 0)
+
+	def msme_suppliers(self, suppliers, details, legacy=True, msme_type=None):
+		"""Run get_suppliers over fake Supplier rows and MSME Details rows."""
+		report = m.MSMEReturn(frappe._dict(from_date="2026-04-01", to_date="2026-09-30", msme_type=msme_type))
+
+		def get_all(doctype, **kwargs):
+			rows = suppliers if doctype == "Supplier" else details
+			return [frappe._dict(r) for r in rows]
+
+		with (
+			patch.object(m.frappe, "get_all", side_effect=get_all),
+			patch.object(m.frappe.db, "has_column", return_value=legacy),
+			patch.object(m.frappe.db, "table_exists", return_value=True),
+		):
+			return {name: s.custom_msme_type for name, s in report.get_suppliers().items()}
+
+	def test_msme_details_table_decides_over_the_old_fields(self):
+		suppliers = [
+			{"name": "S-NEW", "custom_msme_registered": "No", "custom_msme_type": None},
+			{"name": "S-MEDIUM", "custom_msme_registered": "Yes", "custom_msme_type": "Micro"},
+			{"name": "S-OLD", "custom_msme_registered": "Yes", "custom_msme_type": "Micro"},
+		]
+		details = [
+			{"parent": "S-NEW", "msme_registered": "Yes", "msme_type": "Small", "effective_from": "2026-04-01"},
+			{"parent": "S-MEDIUM", "msme_registered": "Yes", "msme_type": "Medium", "effective_from": "2026-04-01"},
+		]
+		self.assertEqual(self.msme_suppliers(suppliers, details), {"S-NEW": "Small", "S-OLD": "Micro"})
+
+	def test_latest_msme_row_in_force_at_period_end_wins(self):
+		suppliers = [{"name": "S-1"}, {"name": "S-LATER"}]
+		details = [  # oldest first, as get_msme_details orders them
+			{"parent": "S-1", "msme_registered": "Yes", "msme_type": "Micro", "effective_from": None},
+			{"parent": "S-1", "msme_registered": "Yes", "msme_type": "Small", "effective_from": "2026-06-01"},
+			{"parent": "S-1", "msme_registered": "No", "msme_type": None, "effective_from": "2026-10-01"},
+			{"parent": "S-LATER", "msme_registered": "Yes", "msme_type": "Micro", "effective_from": "2026-10-01"},
+		]
+		self.assertEqual(self.msme_suppliers(suppliers, details, legacy=False), {"S-1": "Small"})
+
+	def test_old_fields_ignored_where_the_site_no_longer_has_them(self):
+		self.assertEqual(self.msme_suppliers([{"name": "S-1"}], [], legacy=False), {})
+
+	def test_msme_type_filter_applies_to_the_table(self):
+		suppliers = [{"name": "S-MICRO"}, {"name": "S-SMALL"}]
+		details = [
+			{"parent": "S-MICRO", "msme_registered": "Yes", "msme_type": "Micro", "effective_from": "2026-04-01"},
+			{"parent": "S-SMALL", "msme_registered": "Yes", "msme_type": "Small", "effective_from": "2026-04-01"},
+		]
+		self.assertEqual(self.msme_suppliers(suppliers, details, legacy=False, msme_type="Small"), {"S-SMALL": "Small"})
 
 	def test_template_fill_changes_only_the_data_rows(self):
 		with open(m.TEMPLATE, "rb") as f:

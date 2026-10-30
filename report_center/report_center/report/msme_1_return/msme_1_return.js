@@ -54,7 +54,6 @@ frappe.query_reports["MSME-1 Return"] = {
 			label: __("Supplier"),
 			fieldtype: "Link",
 			options: "Supplier",
-			get_query: () => ({ filters: { custom_msme_registered: "Yes" } }),
 		},
 		{
 			fieldname: "ageing_based_on",
