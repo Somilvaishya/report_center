@@ -4,30 +4,39 @@
 """Delivery Note Tracking, in two views.
 
 Tree: one tree per Delivery Note. The DN is the root row and carries everything
-that belongs to the whole document (party, locations, GSTINs, status, grand
-total, transport and, when one invoice bills it, that invoice's IRN and e-way
-bill). Its items sit underneath with what was invoiced against them. An item
-billed across more than one invoice gets one more level: a row per invoice.
+that belongs to the whole document (party, addresses, GSTINs, status, totals,
+transport and, when one invoice bills it, that invoice's IRN and e-way bill).
+Its items sit underneath with what was invoiced against them. An item billed
+across more than one invoice gets one more level: a row per invoice.
 
 Normal: one flat row per DN item and invoice, the DN's details repeated on every
 row. This is also what an export of the tree view writes, so a spreadsheet always
 gets complete rows (see the .js).
 
-Amounts: a tree root shows grand totals (tax included). Every item or invoice
-line, in both views, shows the line's taxable value, the "Amount" on the
-document's item table. When an invoice also bills other DNs, the root shows only
-this DN's share of the invoice's grand total, in proportion to the taxable value
-of its lines. In the normal view an item's DN Qty and DN Value sit on its first
-row only, so a column total never counts an item twice.
+Amounts, for the DN and the invoice side alike: Net Total (before tax), IGST,
+CGST, SGST and Grand Total (after tax).
+- A tree root shows the DN document's own totals. Its invoice side adds up this
+  DN's lines in each invoice; the grand total is this DN's share of the invoice's
+  grand total, in proportion to taxable value, so an invoice billing two DNs is
+  never counted twice.
+- An item or invoice line shows that line: its taxable value, its GST from the
+  item-wise GST fields, and Grand Total = taxable value + GST. Charges outside
+  GST (freight, TCS, rounding) live only in the document's grand total.
+- In the normal view an item's DN qty and amounts sit on its first row only, so
+  a column total never counts an item twice.
 """
+
+import re
 
 import frappe
 from frappe import _
-from frappe.utils import flt, getdate
+from frappe.utils import flt, getdate, strip_html
 
 PENDING = "Pending"
 TREE, NORMAL = "Tree", "Normal"
 CHUNK = 500
+GST = ("igst", "cgst", "sgst")
+AMOUNTS = ("net_total", *GST, "grand_total")
 
 
 def execute(filters=None):
@@ -51,13 +60,24 @@ def get_columns():
 			c["options"] = options
 		return c
 
+	def amounts(prefix, label):
+		return [
+			col(f"{prefix}_net_total", f"{label} Net Total", "Currency", 120, "currency"),
+			col(f"{prefix}_igst", f"{label} IGST", "Currency", 100, "currency"),
+			col(f"{prefix}_cgst", f"{label} CGST", "Currency", 100, "currency"),
+			col(f"{prefix}_sgst", f"{label} SGST", "Currency", 100, "currency"),
+			col(f"{prefix}_grand_total", f"{label} Grand Total", "Currency", 120, "currency"),
+		]
+
 	return [
 		col("delivery_note", "Delivery Note No", "Link", 190, "Delivery Note"),
 		col("posting_date", "Posting Date", "Date", 100),
+		col("return_against", "Return Against DN", "Link", 160, "Delivery Note"),
+		col("return_against_date", "Return Against Date", "Date", 110),
 		col("customer", "Customer Code", "Link", 120, "Customer"),
 		col("customer_name", "Customer Name", "Data", 180),
 		col("location_from", "Billing Location-From", "Link", 150, "Location"),
-		col("location_to", "Billing Location-To", "Link", 150, "Location"),
+		col("location_to", "Billing Location-To", "Data", 200),
 		col("destination", "Destination", "Data", 110),
 		col("item_code", "Item Code", "Link", 120, "Item"),
 		col("item_name", "Item Name", "Data", 180),
@@ -65,7 +85,7 @@ def get_columns():
 		col("gst_hsn_code", "HSN Code", "Data", 90),
 		col("qty", "DN Qty", "Float", 90),
 		col("dn_status", "DN Status", "Data", 110),
-		col("dn_value", "DN Value", "Currency", 120, "currency"),
+		*amounts("dn", "DN"),
 		col("billing_address_gstin", "Billing Address GSTIN", "Data", 150),
 		col("company_gstin", "Company GSTIN", "Data", 150),
 		col("sales_invoice", "Sales Invoice", "Link", 160, "Sales Invoice"),
@@ -73,7 +93,7 @@ def get_columns():
 		col("invoice_time", "Invoice Time", "Time", 90),
 		col("place_of_supply", "Place of Supply", "Data", 140),
 		col("invoice_qty", "Invoice Item Qty", "Float", 100),
-		col("invoice_value", "Invoice Value", "Currency", 120, "currency"),
+		*amounts("si", "SI"),
 		col("irn", "IRN", "Data", 150),
 		col("ack_no", "Ack No", "Data", 130),
 		col("ack_date", "Acknowledged On", "Datetime", 150),
@@ -94,6 +114,14 @@ def present(doctype, fields):
 	meta = frappe.get_meta(doctype)
 	standard = (*frappe.model.default_fields, *frappe.model.child_table_fields)
 	return [f for f in fields if f in standard or meta.has_field(f)]
+
+
+def gst_sums(doctype):
+	"""SQL summing a line table's item-wise GST, or zeros where india_compliance isn't installed."""
+	meta = frappe.get_meta(doctype)
+	return ", ".join(
+		f"sum({t}_amount) as {t}" if meta.has_field(f"{t}_amount") else f"0 as {t}" for t in (*GST, "cess")
+	)
 
 
 def chunks(names):
@@ -130,21 +158,98 @@ def get_delivery_notes(filters):
 	fields = present(
 		"Delivery Note",
 		[
-			"name", "posting_date", "customer", "customer_name", "location", "billing_location",
-			"custom_destination", "status", "base_grand_total", "base_net_total", "billing_address_gstin",
-			"company_gstin", "ewaybill", "transporter_name", "gst_transporter_id", "gst_vehicle_type", "vehicle_no",
+			"name", "posting_date", "customer", "customer_name", "location", "custom_destination", "status",
+			"is_return", "return_against", "customer_address", "address_display",
+			"base_grand_total", "base_net_total", "billing_address_gstin", "company_gstin",
+			"ewaybill", "transporter_name", "gst_transporter_id", "gst_vehicle_type", "vehicle_no",
 		],
 	)
 	dns = frappe.get_list(
 		"Delivery Note", filters=conditions, fields=fields, order_by="posting_date desc, name desc", distinct=True
 	)
-	return {d.name: d for d in dns}
+	dns = {d.name: d for d in dns}
+	add_return_details(dns)
+	add_billing_address(dns)
+	add_dn_taxes(dns)
+	return dns
+
+
+def add_return_details(dns):
+	"""Date of the DN a return was made against; its destination when the return has none."""
+	originals = {d.return_against for d in dns.values() if d.get("return_against")}
+	found = {}
+	if originals:
+		fields = present("Delivery Note", ["name", "posting_date", "custom_destination"])
+		for part in chunks(originals):
+			for o in frappe.get_all("Delivery Note", filters={"name": ["in", part]}, fields=fields):
+				found[o.name] = o
+	for d in dns.values():
+		d.destination = d.get("custom_destination")
+		original = found.get(d.get("return_against"))
+		d.return_against_date = original.posting_date if original else None
+		if d.get("is_return") and not d.destination and original:
+			d.destination = original.get("custom_destination")
+
+
+def add_billing_address(dns):
+	"""City, State - PIN of the billing address as printed on the DN, from the Address when that fails."""
+	need = {d.customer_address for d in dns.values() if d.get("customer_address") and not short_address(d.get("address_display"))}
+	records = {}
+	for part in chunks(need):
+		for a in frappe.get_all("Address", filters={"name": ["in", part]}, fields=["name", "city", "state", "pincode"]):
+			records[a.name] = a
+	for d in dns.values():
+		d.location_to = short_address(d.get("address_display")) or join_address(records.get(d.get("customer_address")))
+
+
+def short_address(display):
+	"""'Faridabad, Haryana - 121003' out of ERPNext's address block:
+	line 1<br>line 2<br>City<br>State, State Code: 06<br>PIN Code: 121003<br>India<br>GSTIN: ..."""
+	if not display:
+		return None
+	lines = [strip_html(l).strip(" ,\n") for l in re.split(r"<br\s*/?>|\n", display)]
+	lines = [l for l in lines if l]
+	state_at = next((i for i, l in enumerate(lines) if "state code" in l.lower()), None)
+	if state_at is None:
+		return None
+	pin = next((re.sub(r"\D", "", l) for l in lines if l.lower().startswith(("pin", "postal"))), None)
+	city = lines[state_at - 1] if state_at > 0 else None
+	return join_address(frappe._dict(city=city, state=lines[state_at].split(",")[0].strip(), pincode=pin))
+
+
+def join_address(a):
+	if not a:
+		return None
+	text = ", ".join(p for p in (a.city, a.state) if p)
+	if a.pincode:
+		text = f"{text} - {a.pincode}" if text else a.pincode
+	return text or None
+
+
+def add_dn_taxes(dns):
+	"""IGST / CGST / SGST from each DN's tax table."""
+	for d in dns.values():
+		d.update({t: 0.0 for t in GST})
+	if not frappe.get_meta("Sales Taxes and Charges").has_field("gst_tax_type"):
+		return
+	for part in chunks(dns):
+		for parent, tax_type, amount in frappe.db.sql(
+			"""select parent, gst_tax_type, sum(base_tax_amount_after_discount_amount)
+			from `tabSales Taxes and Charges`
+			where parenttype = 'Delivery Note' and parent in %(names)s and gst_tax_type in %(types)s
+			group by parent, gst_tax_type""",
+			{"names": part, "types": GST},
+		):
+			dns[parent][tax_type] = flt(amount)
 
 
 def get_items(dns, item_code=None):
 	fields = present(
 		"Delivery Note Item",
-		["name", "parent", "idx", "item_code", "item_name", "item_group", "gst_hsn_code", "qty", "base_net_amount"],
+		[
+			"name", "parent", "idx", "item_code", "item_name", "item_group", "gst_hsn_code", "qty", "base_net_amount",
+			"igst_amount", "cgst_amount", "sgst_amount", "cess_amount",
+		],
 	)
 	select = ", ".join(f"`{f}`" for f in fields)
 	extra = " and item_code = %(item_code)s" if item_code else ""
@@ -157,15 +262,20 @@ def get_items(dns, item_code=None):
 			{"names": part, "item_code": item_code},
 			as_dict=True,
 		)
+	for it in items:
+		it.net = flt(it.base_net_amount)
+		for t in (*GST, "cess"):
+			it[t] = flt(it.get(f"{t}_amount"))
 	return items
 
 
 def get_invoice_lines(dns):
-	"""Invoiced qty and taxable value per (DN item, invoice). Credit notes come in negative."""
+	"""Invoiced qty, taxable value and GST per (DN item, invoice). Credit notes come in negative."""
 	lines = []
 	for part in chunks(dns):
 		lines += frappe.db.sql(
-			"""select delivery_note, dn_detail, parent as sales_invoice, sum(qty) as qty, sum(base_net_amount) as net
+			f"""select delivery_note, dn_detail, parent as sales_invoice, sum(qty) as qty, sum(base_net_amount) as net,
+				{gst_sums("Sales Invoice Item")}
 			from `tabSales Invoice Item`
 			where docstatus = 1 and delivery_note in %(names)s and ifnull(dn_detail, '') != ''
 			group by delivery_note, dn_detail, parent""",
@@ -232,6 +342,19 @@ def as_time(value):
 	return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
 
 
+def line_amounts(prefix, lines):
+	"""Net, GST and grand total (net + GST) of one or more lines, as dn_* or si_* columns."""
+	out = {f"{prefix}_net_total": sum(flt(l.net) for l in lines)}
+	for t in GST:
+		out[f"{prefix}_{t}"] = sum(flt(l.get(t)) for l in lines)
+	out[f"{prefix}_grand_total"] = sum(flt(l.net) + sum(flt(l.get(t)) for t in (*GST, "cess")) for l in lines)
+	return out
+
+
+def blank_amounts(prefix):
+	return {f"{prefix}_{a}": None for a in AMOUNTS}
+
+
 def invoice_fields(si):
 	return {
 		"sales_invoice": si.name,
@@ -269,11 +392,13 @@ def dn_fields(dn):
 	return {
 		"delivery_note": dn.name,
 		"posting_date": dn.posting_date,
+		"return_against": dn.get("return_against") or None,
+		"return_against_date": dn.get("return_against_date"),
 		"customer": dn.customer,
 		"customer_name": dn.customer_name,
 		"location_from": dn.get("location"),
-		"location_to": dn.get("billing_location"),
-		"destination": dn.get("custom_destination"),
+		"location_to": dn.get("location_to"),
+		"destination": dn.get("destination"),
 		"dn_status": dn.status,
 		"billing_address_gstin": dn.get("billing_address_gstin"),
 		"company_gstin": dn.get("company_gstin"),
@@ -317,11 +442,15 @@ def build_rows(dns, items, lines, invoices, view=TREE):
 		lines_by_item = {
 			it.name: sorted(lines_of.get(it.name, []), key=lambda l: by_date(l.sales_invoice)) for it in dn_items
 		}
+		all_lines = [l for its in lines_by_item.values() for l in its]
 		total = {
 			"qty": sum(flt(i.qty) for i in dn_items),
-			"dn_value": flt(dn.base_grand_total),
-			"invoice_qty": sum(flt(l.qty) for its in lines_by_item.values() for l in its),
-			"invoice_value": sum(invoice_share(invoices[n], billed[n]) for n in names),
+			"dn_net_total": flt(dn.base_net_total),
+			**{f"dn_{t}": flt(dn.get(t)) for t in GST},
+			"dn_grand_total": flt(dn.base_grand_total),
+			"invoice_qty": sum(flt(l.qty) for l in all_lines),
+			**line_amounts("si", all_lines),
+			"si_grand_total": sum(invoice_share(invoices[n], billed[n]) for n in names),
 			"invoiced": bool(names),
 		}
 		totals.append(total)
@@ -339,11 +468,8 @@ def tree_rows(dn, dn_items, lines_by_item, invoices, names, total):
 		**dn_fields(dn),
 		"parent_delivery_note": None,
 		"indent": 0,
-		"qty": total["qty"],
-		"dn_value": total["dn_value"],
+		**{k: v for k, v in total.items() if k != "invoiced"},
 		"sales_invoice": invoice_label(len(names)),
-		"invoice_qty": total["invoice_qty"],
-		"invoice_value": total["invoice_value"],
 	}
 	if single:
 		with_invoice(root, single)
@@ -356,9 +482,9 @@ def tree_rows(dn, dn_items, lines_by_item, invoices, names, total):
 			"indent": 1,
 			**item_fields(it),
 			"qty": flt(it.qty),
-			"dn_value": flt(it.base_net_amount),
+			**line_amounts("dn", [it]),
 			"invoice_qty": sum(flt(l.qty) for l in its),
-			"invoice_value": sum(flt(l.net) for l in its),
+			**line_amounts("si", its),
 		}
 		if not its:
 			row["sales_invoice"] = PENDING
@@ -376,7 +502,7 @@ def tree_rows(dn, dn_items, lines_by_item, invoices, names, total):
 						"indent": 2,
 						**invoice_fields(invoices[l.sales_invoice]),
 						"invoice_qty": flt(l.qty),
-						"invoice_value": flt(l.net),
+						**line_amounts("si", [l]),
 					}
 				)
 	return rows
@@ -390,15 +516,15 @@ def normal_rows(dn, dn_items, lines_by_item, invoices):
 			row = {
 				**head,
 				**item_fields(it),
-				# the item's own qty and value on its first row only, so totals don't double
+				# the item's own qty and amounts on its first row only, so totals don't double
 				"qty": flt(it.qty) if i == 0 else None,
-				"dn_value": flt(it.base_net_amount) if i == 0 else None,
+				**(line_amounts("dn", [it]) if i == 0 else blank_amounts("dn")),
 			}
 			if l:
 				with_invoice(row, invoices[l.sales_invoice])
-				row.update(invoice_qty=flt(l.qty), invoice_value=flt(l.net))
+				row.update(invoice_qty=flt(l.qty), **line_amounts("si", [l]))
 			else:
-				row.update(sales_invoice=PENDING, invoice_qty=0.0, invoice_value=0.0)
+				row.update(sales_invoice=PENDING, invoice_qty=0.0, **line_amounts("si", []))
 			rows.append(row)
 	return rows
 
@@ -406,10 +532,16 @@ def normal_rows(dn, dn_items, lines_by_item, invoices):
 def get_summary(totals, currency):
 	total = lambda f: sum(flt(t[f]) for t in totals)  # noqa: E731
 	pending = sum(1 for t in totals if not t["invoiced"])
+
+	def money(label, field):
+		return {"label": _(label), "value": total(field), "datatype": "Currency", "currency": currency}
+
 	return [
 		{"label": _("Delivery Notes"), "value": len(totals), "datatype": "Int"},
-		{"label": _("DN Value (with tax)"), "value": total("dn_value"), "datatype": "Currency", "currency": currency},
-		{"label": _("Invoice Value (with tax)"), "value": total("invoice_value"), "datatype": "Currency", "currency": currency},
+		money("DN Net Total", "dn_net_total"),
+		money("DN Grand Total", "dn_grand_total"),
+		money("SI Net Total", "si_net_total"),
+		money("SI Grand Total", "si_grand_total"),
 		{"label": _("DN Qty"), "value": total("qty"), "datatype": "Float"},
 		{"label": _("Invoiced Qty"), "value": total("invoice_qty"), "datatype": "Float"},
 		{"label": _("DNs not invoiced"), "value": pending, "datatype": "Int", "indicator": "Orange" if pending else "Green"},
